@@ -1,0 +1,102 @@
+---
+title: "Anaylysis for Association of ADHD with full trajectories leading to cardiorenal death: key codes for transition rates parameter estimation"
+author: Yiling Zhou
+R version: 4.4.0
+---
+# Part 1: Multistate model (P3)
+
+## 1. set the transition matrix
+
+**tmat**: transition matrix: total 19 transitions
+
+```{r}
+tmat <- matrix(NA, 7, 7)
+dimnames(tmat) <- list(from = c("hypertension", "CKD", "stroke","AMI", "HHF","CRdeath", "noCRdeath"),
+                       to = c("hypertension", "CKD", "stroke", "AMI", "HHF", "CRdeath", "noCRdeath"))
+tmat[1,] <- c(NA,1,2,3,4,5,6)
+tmat[2,] <- c(NA,NA,NA,NA,NA,7,8)
+tmat[3,] <- c(NA,NA,NA,NA,NA,9,10)
+tmat[4,] <- c(NA,NA,NA,NA,NA,11,12)
+tmat[5,] <- c(NA,NA,NA,NA,NA,13,14)
+tmat[6,] <- c(NA,NA,NA,NA,NA,NA,NA)
+tmat[7,] <- c(NA,NA,NA,NA,NA,NA,NA)
+
+print(tmat)
+```
+
+## 2. create multiple state transitions data
+
+```{r}
+library(mstate)
+
+covs <- c("pin")
+dt <- as.data.frame(dt)
+## start state: state into which no transitions are possible, set NA for time and status in the msprep function. (ref: mstate)
+msbmt <- msprep(time = c(NA, "CKD_time", "stroke_time", "AMI_time", "HHF_time", "CRdeath_time", "noCRdeath_time"),
+                status = c(NA, "CKD", "stroke", "AMI", "HHF", "CRdeath", "noCRdeath"), 
+                data = dt, 
+                trans = tmat,
+                keep = covs) 
+
+events(msbmt) %>% print()
+
+setDT(dt)
+msbmt <- as_tibble(msbmt)
+msbmt <- msbmt %>% dplyr::select(pin, Tstart, Tstop, time, trans, status) 
+setDT(msbmt)
+```
+
+## 3. estimate cox model for each transition
+
+### Step 1: functions
+
+```{r}
+# Define format function
+myformat <- function(x, digit = 4, sep = TRUE) {format(round(as.numeric(x), digit), nsmall = digit, trim = TRUE, big.mark = ifelse(sep, ",", ""))}
+
+# Define Cox regression function
+cox_analysis <- function(data, formula, transition_number, part){
+  model <- coxph(formula, data = data, id = pin, model = TRUE) # robust = TRUE and FALSE are the same
+  saveRDS(model, paste0("processData/",part,"/model_transition", transition_number, ".rds"))
+}
+
+fit_model <- function(transition, cox_formulas, data_base, data_ms, part){
+  ## get tidied time-varying data for each transition
+  msdt <- data_ms[trans== transition, ]
+  covdt <- data_base[pin%in%msdt$pin,]
+  tsdt <- msdt[covdt, on =.(pin = pin, Tstop >= tstop, Tstart <=tstart)][!is.na(trans),]
+  # update baseline over time from baseline.
+  tsdt <- tsdt[, hypertension_duration := min(Tstart), by = pin][, hypertension_duration:= hypertension_duration/365]
+  tsdt[, baseline_yr:=baseline_yr+as.integer(hypertension_duration)]
+  tsdt[, age:=age+as.integer(hypertension_duration)]
+  
+  tsdt[order(pin, Tstart), `:=`(tstart = Tstart - min(Tstart), tstop = Tstop - min(Tstart)), by = pin]
+  tsdt[tstop<time, status := 0]
+  tsdt <- as.data.frame(tsdt)
+  ## choose formula
+  if(transition <=6){formula = cox_formulas$formula1}else{formula = cox_formulas$formula2}
+
+  ## estimate cox model use tsdt for each transition
+  cox_analysis(data = tsdt, formula = formula, transition_number = transition, part = part)
+}
+```
+
+
+### Step 2: fitted model
+
+```{r}
+##################### estimate HR ########################
+# define formulas for analysis         
+cox_formulas <-list(
+  formula1 = Surv(tstart, tstop, status) ~ exposure + on_adhd_med + sex + baseline_yr_cat + age + hypertension_med + t2d + hyperlipid,
+  formula2 = Surv(tstart, tstop, status) ~ exposure + on_adhd_med + sex + baseline_yr_cat + age + hypertension_med + t2d + hyperlipid + hypertension_duration) 
+
+
+for(i in 1:14){
+  fit_model(transition = i, cox_formulas = cox_formulas, data_base = dt_base, data_ms = msbmt, part = "adhd")
+  print(i)
+}
+```
+
+
+
