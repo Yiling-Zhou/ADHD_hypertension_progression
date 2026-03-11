@@ -1,0 +1,797 @@
+---
+title: "Multi-state model for prognosis of hypertension"
+format: html
+author: Yiling Zhou
+R version: 4.2.3
+Input data: rx_hyper_med, rx_adhd_med, cohort_admin, dx_outcomes, dx_adhd_diag
+---
+
+# Load R packages
+
+To avoide the functions from data.table are masked by those with same names from other packages, please load data.table lastly.
+
+tidyverse and dplyr are required, but do not load them here; instead, load them at the specified location by using tidyverse::fun.
+
+```{r}
+library(tableone)
+library(ggplot2)
+library(IRanges)
+library(survminer)
+library(survival)
+library(tibble)
+library(data.table)
+```
+
+# Change the working directory
+
+```{r}
+knitr::opts_chunk$set(root.dir = "H:/Project/Multistate_ADHDandHTN")
+```
+
+# Provide general information
+
+**recruit_start**: the start date from which study population was selected. 
+**recruit_end**: the end date from which study population was selected 2020-12-31
+**admin_end**: the end date of the follow up: 2022-12-31.
+
+```{r}
+recruit_start <- as.IDate("2013-01-01")
+recruit_end <- as.IDate("2020-12-31")
+admin_end <- as.IDate("2022-12-31")
+```
+
+# Import data
+
+```{r}
+rx_hyper_med <- fread("processData/rx_hyper_med.csv", header = TRUE, sep = "," ,colClasses = list(character = "pin"))
+
+cohort_admin <- fread("processData/cohort_admin.csv", header = TRUE, sep = ",", colClasses = list(character = "pin"))
+
+rx_adhd_med <- fread("processData/rx_adhd_med.csv", header = TRUE, sep = ",", colClasses = list(character = "pin"))
+dx_adhd_diag <- fread("processData/dx_adhd_diag.csv", header = TRUE, sep = ",", colClasses = list(character = "pin"))
+
+dx_outcomes <- fread("processData/dx_outcomes.csv", header = TRUE, sep = "," ,colClasses = list(character = "pin"))
+```
+
+# Data clean
+
+## Format all variables
+
+**Assumption**: dispensation at the same date was considering as one combined treatment regimen, with the supply from all the dispensations comprising a single treatment duration.
+
+```{r}
+## cohort_admin
+date_names <- names(cohort_admin)[names(cohort_admin) %like% "_date$"]
+cohort_admin[, (date_names) := lapply(.SD, as.IDate), .SDcols = date_names]
+cohort_admin[, (setdiff(names(cohort_admin), c("pin", date_names, "SES"))) := lapply(.SD, as.integer), .SDcols = setdiff(names(cohort_admin), c("pin", date_names, "SES"))]
+cohort_admin <- unique(cohort_admin)
+setnames(cohort_admin, old="id",new="intellectual")
+
+## rx_adhd_med
+rx_adhd_med <- rx_adhd_med[, adhd_disp_date := as.IDate(adhd_disp_date)][!is.na(adhd_disp_date),]
+
+## dx_adhd_diag
+dx_adhd_diag <- dx_adhd_diag[, adhd_diag_date := as.IDate(adhd_diag_date)][!is.na(adhd_diag_date),]
+dx_adhd_diag <- unique(dx_adhd_diag)
+
+## rx_hyper_med
+rx_hyper_med <- rx_hyper_med[, disp_date := as.IDate(disp_date)][!is.na(disp_date),]
+rx_hyper_med <- unique(rx_hyper_med)
+
+## dx_outcomes
+date_names <- names(dx_outcomes)[names(dx_outcomes) %like% "_date$"]
+dx_outcomes[, (date_names) := lapply(.SD, as.IDate), .SDcols = date_names]
+```
+
+## Deal with multiple prescriptions for ADHD, hypertension on the same date
+
+**Assumption**: multiple prescriptions filled on the same day are considered as one combined treatment regimen, with the supply from all the prescriptions comprising a single treatment duration.
+
+```{r}
+rx_adhd_med <- rx_adhd_med[, .SD[1], by =.(pin, adhd_disp_date)]
+rx_hyper_med <- rx_hyper_med[, .SD[1], by =.(pin, disp_date)]
+```
+
+# Part 1: Identify study population (P1)
+
+One output in this part: P1_Participants_excluded.csv
+
+## 1. identify the individuals newly diagnosed with hypertension
+
+### Step 1: identify individuals starting C03A, C03B C08C, C09 between recruit_start and recruit_end, e.g., 2020-12-31 (excl. recruit_end)
+
+hyper_patient is data.table, with two variables, pin, their baseline date. One row per individual.
+
+```{r}
+hyper_patient <- rx_hyper_med[atc %in% c("C03A", "C03B", "C08C", "C08G", "C09A", "C09B", "C09C", "C09D"),][disp_date>=recruit_start & disp_date<recruit_end, ] 
+hyper_patient[, baseline_date := min(disp_date, na.rm = TRUE), by = pin] 
+hyper_patient <- unique(hyper_patient[, .(pin, baseline_date)])
+```
+
+### Step 2: had not been prescribed any these medication C03, C08, C09 before baseline (excl.baseline)
+
+```{r}
+exclude_patient <- unique(rx_hyper_med[pin%in%hyper_patient$pin,])[hyper_patient, on = .(pin = pin)][disp_date < baseline_date,]
+hyper_patient1 <- hyper_patient[!pin%in%exclude_patient$pin, ]
+rm(exclude_patient)
+```
+
+### Step 3: these medications were not used to treat other diseases at baseline, without established CHD, without CKD before or at baseline
+
+i.e., without any diagnosis of CKD, ESKD, diabetic nephropathy, glomerular diseases, HF, CHD, or without medication that are served as proxy for MACE and CKD, before and at baseline: otherIndication == 0
+
+```{r}
+hyper_patient1 <- cohort_admin[hyper_patient1, on = .(pin = pin)]
+hyper_patient2 <- copy(hyper_patient1)
+```
+
+### 2. apply exclusion criteria
+
+```{r}
+# Create baseline_mn and baseline_yr to prepare for calculating baseline age
+hyper_patient2[, `:=` (baseline_mn = data.table::month(baseline_date), baseline_yr =  data.table::year(baseline_date))]
+# Calculate the baseline age
+hyper_patient2[(birth_mn > baseline_mn), age :=  baseline_yr - birth_yr - 1]
+hyper_patient2[(birth_mn <= baseline_mn), age :=  baseline_yr - birth_yr]
+
+# 1. exclude individuals with missing data in sex, birth year, birth month
+hyper_patient3 <- hyper_patient2[!is.na(sex), ][!is.na(birth_yr),][!is.na(birth_mn),]
+
+# 2. exclude age < 18 years
+hyper_patient4 <- hyper_patient3[age>=18&age<=90, ]
+
+# 3. exclude who emigrated before or at baseline 
+hyper_patient5 <- hyper_patient4[is.na(emigration_date)|emigration_date > baseline_date,]
+
+# 4. exclude individuals with error data, i.e.,who died before or at baseline 
+hyper_patient6 <- hyper_patient5[is.na(death_date)|death_date > baseline_date,]
+
+# 5. exclude who had a outcome, HF, MI, HF, CR death, non-CR death, unnatural death before baseline or at baseline
+hyper_patient6 <- dx_outcomes[hyper_patient6, on = .(pin = pin)]
+hyper_patient7 <- hyper_patient6[is.na(stroke_date)|stroke_date > baseline_date,][is.na(AMI_date)|AMI_date > baseline_date,][is.na(HHF_date)|HHF_date > baseline_date,][is.na(CKD_date)|CKD_date > baseline_date,][is.na(unnaturaldeath_date)|unnaturaldeath_date > baseline_date,][is.na(CRdeath_date)|CRdeath_date > baseline_date,][is.na(noCRdeath_date)|noCRdeath_date > baseline_date,][otherIndication == 0,]
+
+## the final study population, including all variables in cohort admin 
+dt <- copy(hyper_patient7)
+## remove useless columns
+dt[, baseline_mn:=NULL]
+dt[, birth_yr:=NULL]
+dt[, birth_mn:=NULL]
+dt[, otherIndication:=NULL]
+```
+
+#### P1_Participants_excluded.csv
+
+Export table for flowchart
+
+```{r}
+Participants_excluded <- tibble::tibble(all = uniqueN(hyper_patient$pin), 
+                                washout = uniqueN(hyper_patient1$pin), 
+                                otherIndications = uniqueN(hyper_patient2$pin),
+                                missing = uniqueN(hyper_patient3$pin),
+                                age = uniqueN(hyper_patient4$pin), 
+                                emigration = uniqueN(hyper_patient5$pin), 
+                                die = uniqueN(hyper_patient6$pin), 
+                                outcome = uniqueN(hyper_patient7$pin))
+
+write.csv2(Participants_excluded, file = "results/P1_participants_excluded.csv", quote = F)
+```
+
+remove useless data table/data frame/tibble
+
+```{r}
+delete <- ls(pattern = "^hyper_patient")
+rm(list = c(delete, "Participants_excluded", "cohort_admin", "dx_outcomes"))
+gc()
+```
+
+# Define variables
+
+## 1. define key variables
+
+**age_cat**: age group at baseline, young, middle age, elderly.
+
+**baseline_yr**: calendar year of baseline, already defined at the prior step-age calculation.
+
+**sex**: 0 is female, 1 is male.
+
+**follow_end**: date, end of follow up for each individual, the earliest date among emigration_date, death_date, admin_end.
+
+Other variaibles have been defined during the preparation for cohort admin.
+
+```{r}
+dt[, age_cat := cut(age, breaks = c(17, 34, 64, Inf), labels = c("young adult", "middle-aged", "elderly"), right = TRUE)]
+dt[, baseline_yr_cat := fifelse(baseline_yr <2018, 0, 1)]
+dt[, sex:=factor(sex, levels = c(1, 0), labels = c("male", "female"))]
+
+dt[, follow_end := pmin(emigration_date, death_date, admin_end, na.rm = T)]
+
+## remove useless columns
+dt[, emigration_date:=NULL]
+```
+
+## 2. define baseline ADHD status (diagnosis and medication)
+
+**adhd_baseline**: baseline ADHD status (0 vs 1), assessed using data from start of registers to baseline.
+
+**adhd_date**: date, the first date of ADHD diagnosis based on diagnosis and medication.
+
+```{r}
+## first date of adhd based on diagnosis and medication
+adhd <- rx_adhd_med[,.(pin, adhd_disp_date)]
+setnames(adhd, old = "adhd_disp_date", new = "adhd_diag_date")
+adhd <- unique(rbind(adhd, dx_adhd_diag))
+adhd[, adhd_date := min(adhd_diag_date, na.rm = TRUE), by = pin]
+adhd <- unique(adhd[,.(pin, adhd_date)])
+
+### join with dt and define baseline ADHD status
+dt <- adhd[dt, on=.(pin = pin)]
+dt[, adhd_baseline:=fifelse(is.na(adhd_date)|adhd_date>baseline_date, 0, 1)]
+dt[, adhd_baseline:=factor(adhd_baseline, levels = c(0, 1), labels = c("no ADHD", "ADHD"))]
+
+# remove data
+rm(adhd)
+rm(dx_adhd_diag)
+```
+
+## 3. define outcome and survival time 
+
+**CRdeath** (0 vs 1).
+
+**CRdeath_time**: survival time.
+
+Note:
+1. dt_outcomes: if AMI, stroke, HHF, or CKD happens on the same date of death, then CR event will be as 1 and death will happen after 1 day (fatal event).
+2. adjust the CV and CKD dates happen on the same date: only 4 individuals
+
+```{r}
+# CR death
+dt[, CRdeath_date:=fifelse(CRdeath_date>follow_end, as.IDate(NA), CRdeath_date)]
+dt[, CRdeath := fifelse(is.na(CRdeath_date)|CRdeath_date>follow_end, 0, 1)]
+dt[CRdeath == 1, CRdeath_time := CRdeath_date - baseline_date]
+dt[CRdeath == 0, CRdeath_time := follow_end - baseline_date]
+
+# non-CR death and unnatural death
+dt[, noCRdeath_date:=pmin(noCRdeath_date, unnaturaldeath_date, na.rm = TRUE)]
+dt[, unnaturaldeath_date:=NULL]
+dt[, noCRdeath_date:=fifelse(noCRdeath_date>follow_end, as.IDate(NA), noCRdeath_date)]
+dt[, noCRdeath := fifelse(is.na(noCRdeath_date)|noCRdeath_date>follow_end, 0, 1)]
+dt[noCRdeath == 1, noCRdeath_time := noCRdeath_date - baseline_date]
+dt[noCRdeath == 0, noCRdeath_time := follow_end - baseline_date]
+
+# HHF
+dt[, HHF_date:=fifelse(HHF_date>follow_end, as.IDate(NA), HHF_date)]
+dt[, HHF := fifelse(is.na(HHF_date)|HHF_date>follow_end, 0, 1)]
+dt[HHF == 1, HHF_time := HHF_date - baseline_date]
+dt[HHF == 0, HHF_time := follow_end - baseline_date]
+
+# AMI
+dt[, AMI_date:=fifelse(AMI_date>follow_end, as.IDate(NA), AMI_date)]
+dt[, AMI := fifelse(is.na(AMI_date)|AMI_date>follow_end, 0, 1)]
+dt[(!is.na(AMI_date) & HHF_date==AMI_date), AMI_date:= AMI_date-1]
+dt[AMI == 1, AMI_time := AMI_date - baseline_date]
+dt[AMI == 0, AMI_time := follow_end - baseline_date]
+
+
+# stroke
+dt[, stroke_date := fifelse(stroke_date>follow_end, as.IDate(NA), stroke_date)]
+dt[, stroke := fifelse(is.na(stroke_date)|stroke_date>follow_end, 0, 1)]
+dt[(!is.na(stroke_date) & HHF_date==stroke_date), stroke_date:= stroke_date-1]
+dt[(!is.na(stroke_date) & AMI_date==stroke_date), stroke_date:= stroke_date-1]
+dt[stroke == 1, stroke_time := stroke_date - baseline_date]
+dt[stroke == 0, stroke_time := follow_end - baseline_date]
+
+# CKD
+dt[, CKD_date:=fifelse(CKD_date>follow_end, as.IDate(NA), CKD_date)]
+dt[, CKD := fifelse(is.na(CKD_date)|CKD_date>follow_end, 0, 1)]
+dt[(!is.na(CKD_date) & CKD_date==AMI_date), CKD_date:= CKD_date-1]
+dt[(!is.na(CKD_date) & CKD_date==stroke_date), CKD_date:= CKD_date-1]
+dt[(!is.na(CKD_date) & CKD_date==HHF_date), CKD_date:= CKD_date-1] 
+## adjust for total 4 individuals
+dt[CKD == 1, CKD_time := CKD_date - baseline_date]
+dt[CKD == 0, CKD_time := follow_end - baseline_date]
+```
+
+# Part 2: Descriptive analysis (P2)
+
+## S1. descriptive analysis for baseline table: baseline ADHD vs no ADHD
+
+*P2_S1_descriptives_result.csv*
+
+**follow_end_days**: follow end date - baseline date
+
+```{r}
+dt[, ESKD_date:=fifelse(ESKD_date>follow_end, as.IDate(NA), ESKD_date)]
+dt[, ESKD := fifelse(is.na(ESKD_date)|ESKD_date>follow_end, 0, 1)]
+dt[, admission_follow := admin_end- baseline_date]
+dt[, follow_end_days := follow_end - baseline_date]
+dt[, psych_number := asd+sud+scz+dep+anx+bip+ed+pd+intellectual]
+dt[, psych_number := fifelse(psych_number>2, 3, psych_number)] # levels: 0, 1, 2, 3 or over
+dt[, psych_any := fifelse(psych_number == 0, 0, 1)]
+dt[, nd:= pmax(asd,intellectual)]
+dt[, ma:= pmax(anx, dep, bip)]
+dt[, psych_med_any := fifelse(add_med+anxio_med+dep_med+ep_med+hy_se_med+psycho_med == 0, 0, 1)]
+dt[, age_sex_group:=paste0(age_cat, "_", sex)]
+
+vars <- c("age", "age_cat", "sex", "age_sex_group","SES", "admission_follow", "follow_end_days", "psych_any", "nd", "asd", "intellectual", "ma", "anx",  "bip", "dep", "scz", "pd", "ed", "sud", "psych_med_any","add_med", "anxio_med", "dep_med","ep_med", "hy_se_med", "psycho_med", "t2d", "hyperlipid")
+catVars<-c("age_cat", "sex", "age_sex_group","SES", "psych_any", "nd", "asd", "intellectual", "ma", "anx",  "bip", "dep", "scz", "pd", "ed", "sud", "psych_med_any", "add_med", "anxio_med", "dep_med","ep_med", "hy_se_med", "psycho_med")
+nonnormals <- c("age","admission_follow", "follow_end_days")
+
+table <- CreateTableOne(vars = vars,
+                        strata = "adhd_baseline",
+                        data = dt,
+                        factorVars = catVars,
+                        addOverall = TRUE)
+P2_S1_result <- print(table,
+                   showAlLevels = TRUE,
+                   nonnormal = nonnormals,
+                   formatOptions = list(big.mark = ","),
+                   pDigits =3,
+                   catDigits =1,
+                   conDigists =1,
+                   quote=FALSE,
+                   noSpace = TRUE,
+                   printToggle = FALSE,
+                   addOverall =TRUE)
+
+write.csv2(P2_S1_result, file = "results/P2_S1_descriptives_result.csv",quote = F)
+rm(table)
+rm(P2_S1_result)
+```
+
+# Define time-varying antihypertensive medication on or off
+
+## Step 1: update rx_hyper_med for study population between baseline_date to follow_end.
+
+Note: baseline_date is one disp_date in rx_hyper_med, thus we can filter rows where disp_date \>= baseline_date. but for ADHD medication data, we do not apply this filter, since prior dispensation may last beyond the baseline date.
+
+**disp_end**: date, the date of last dispensation of antihypertensive medication before the end of follow up.
+
+```{r}
+rx_hyper_med <- rx_hyper_med[pin %in% dt$pin, ]
+rx_hyper_med[, atc := NULL]
+rx_hyper_med <- dt[,.(pin, baseline_date, follow_end, age_cat, sex)][rx_hyper_med, on =.(pin=pin)]
+rx_hyper_med <- rx_hyper_med[disp_date<=follow_end & disp_date>=baseline_date, ]
+rx_hyper_med[, disp_end := max(disp_date, na.rm = TRUE), by = pin]
+```
+
+## Step 2: estimate the refill gap for antihypertensive medication.
+
+**refill_gap**: days, the refill gap is defined as the days supplied per dispensation; = 90% percentile of dispensation intervals stratified by sex and age group.
+
+**interval**: days of dispensation interval.
+
+**hyper_each_end**: date, the end date of supply for this specified dispensation of antihypertensive medication.
+
+```{r}
+## intervals of two consecuitive dispensations
+rx_hyper_med <- rx_hyper_med[order(pin, disp_date),]
+rx_hyper_med[, interval :=  data.table::shift(disp_date, type = "lead") - disp_date, by = pin]
+rx_hyper_med[is.na(interval), interval:= follow_end - disp_date]
+
+## 90% of qunatiles using (interval>0 and not the last interval)
+quantile_hyper_med <- rx_hyper_med[disp_date < disp_end & interval>0, ][, .(refill_gap = as.integer(quantile(interval, 0.75, na.rm =T))), by = .(age_cat, sex)]
+
+## refill gap for each individual
+rx_hyper_med <- quantile_hyper_med[rx_hyper_med, on =.(age_cat, sex)]
+
+## hyper_each_end for each dispensation
+rx_hyper_med[, hyper_each_end := disp_date + refill_gap]
+
+## adjust the end date if they are later than follow_end.
+rx_hyper_med[, hyper_each_end:= fifelse(follow_end < hyper_each_end, follow_end, hyper_each_end)]
+
+write.csv2(quantile_hyper_med, file = "results/quantile_hyper_med.csv",quote = F)
+rm(quantile_hyper_med)
+```
+
+## Step 3: identify the dates on which anti-hypertensive medication administered.
+
+reduce the overlapping dispensation records to non-overlap treat period data.
+
+**hyper_start**: date, start of each treated period.
+
+**hyper_end**: date, end of that treated period.
+
+```{r}
+rx_hyper <- rx_hyper_med[, {
+  ir <- reduce(IRanges(as.numeric(disp_date), as.numeric(hyper_each_end)))
+  .(start = as.IDate(start(ir)), end = as.IDate(end(ir)))}, by = pin] 
+setnames(rx_hyper, old = "start", new = "hyper_start")
+setnames(rx_hyper, old = "end", new = "hyper_end")
+```
+
+## Step 4: identify times since baseline when on and off hypertension treatment.
+
+**hyper_treat_date:** date, the dates on which each hypertension drug treatment period starts or ends.
+
+**hyper_treat_type**: 2 levels: start or end, the start or end of each treat period.
+
+**since_baseline_time**: days, the days between hyper_treat_date to baseline date.
+
+**off_hyper_med**: 0 or 1, 1-times since baseline when without using antihypertensive medication.
+
+**rx_hyper**: a data.table for ADHD and outcome analysis.
+
+**rx_hyper_adhdPopulation**: data.table for ADHD medication and outcome analysis.
+
+```{r}
+## dates when start or end.
+rx_hyper <- melt(rx_hyper, id.vars = "pin", measure.vars = c("hyper_start", "hyper_end"), variable.name = "hyper_treat_type", value.name = "hyper_treat_date")
+
+rx_hyper <- rx_hyper[dt[,.(pin,baseline_date,follow_end)], on = .(pin)] 
+
+## time since baseline when starts or ends .
+rx_hyper[, since_baseline_time := hyper_treat_date - baseline_date]
+
+## code the hypertension medication treat off and on under time since baseline
+rx_hyper[, off_hyper_med := fifelse(hyper_treat_type == "hyper_end", 1, 0)]
+rx_hyper <- rx_hyper[,.(pin, off_hyper_med, since_baseline_time)]
+
+rm(rx_hyper_med)
+```
+
+# Define time-varing ADHD medication on or off
+
+## Step 1: update rx_adhd_med for study population before or at follow_end.
+
+**adhd_disp_end**: the last prescription date before follow_end.
+
+```{r}
+rx_adhd_med <- rx_adhd_med[pin %in% dt$pin,]
+# join dt_med and rx_adhd_med
+rx_adhd_med <- dt[rx_adhd_med, on = .(pin)]
+rx_adhd_med <- rx_adhd_med[adhd_disp_date<=follow_end, ]
+rx_adhd_med[, adhd_disp_end :=  max(adhd_disp_date, na.rm = TRUE), by = pin]
+rx_adhd_med <- rx_adhd_med[order(pin, adhd_disp_date),]
+```
+
+## Step 2: estimate the refill gap of ADHD medication.
+
+**adhd_refill_gap**: days, the refill gap is defined as the days supplied per dispensation; = 90% percentile of dispensation intervals stratified by sex and age group.
+
+**interval**: days of dispensation interval.
+
+**adhd_each_end**: date, the end date of supply for this specified dispensation of ADHD medication.
+
+```{r}
+## interval of two consecuitive dispensations
+rx_adhd_med[, interval :=  data.table::shift(adhd_disp_date, type = "lead") - adhd_disp_date, by = pin]
+
+rx_adhd_med[is.na(interval), interval:= follow_end-adhd_disp_date]
+
+## adhd_refill_gap: 90% quantile of intervals (>0 and not the last dispensation).
+quantile_adhd_med <- rx_adhd_med[adhd_disp_date < adhd_disp_end & interval>0 & adhd_disp_date>=baseline_date, ][, .(adhd_refill_gap = as.integer(quantile(interval, 0.75, na.rm =T))), by = .(age_cat, sex)]
+
+rx_adhd_med <- quantile_adhd_med[rx_adhd_med, on =.(age_cat, sex)]
+
+## adhd_each_end for each dispensation
+rx_adhd_med[, adhd_each_end := adhd_disp_date + adhd_refill_gap]
+
+## adjust the end date if they are later than follow_end.
+rx_adhd_med[, adhd_each_end:= fifelse(follow_end < adhd_each_end, follow_end, adhd_each_end)]
+
+write.csv2(quantile_adhd_med, file = "results/quantile_adhd_med.csv",quote = F)
+rm(quantile_adhd_med)
+```
+
+## Step 3: identify the dates on which ADHD medication administered.
+
+reduce the overlapping dispensation records to non-overlap treat period data.
+
+**adhd_start**: date, start of each treated period.
+
+**adhd_end**: date, end of that treated period.
+
+```{r}
+rx_adhd_med <- rx_adhd_med[order(pin, adhd_disp_date),]
+
+## reduce the overlapping treated time, create variables: adhd_start and adhd_end.
+rx_adhd <- rx_adhd_med[, {
+  ir <- IRanges::reduce(IRanges(as.numeric(adhd_disp_date), as.numeric(adhd_each_end)))
+  .(start = as.IDate(start(ir)), end = as.IDate(end(ir)))}, by = pin]  
+
+setnames(rx_adhd, old = "start", new = "adhd_start")
+setnames(rx_adhd, old = "end", new = "adhd_end")
+rm(rx_adhd_med)
+
+## select ADHD medication dispensation data from baseline date to follow-end
+rx_adhd <- dt[,.(pin, baseline_date)][rx_adhd, on =.(pin)]
+rx_adhd <- rx_adhd[adhd_start >= baseline_date|(adhd_start<baseline_date & adhd_end>baseline_date),]
+## re-define the adhd_start if it is before baseline date
+rx_adhd[, adhd_start:= fifelse(adhd_start<=baseline_date & adhd_end > baseline_date, baseline_date, adhd_start)]
+rx_adhd[, baseline_date:=NULL]
+```
+
+## Step 4: identify times since baseline when ADHD treatment on and off.
+
+**adhd_treat_date:** date, the dates on which each ADHD treat period starts or ends; NA for those never treated with ADHD medication since baseline.
+
+**adhd_treat_type**: 3 levels: start or end or never, the start or end of each ADHD treat period, or never treated with ADHD medication since baseline.
+
+**since_baseline_time**: days, the days between adhd_treat_date to baseline date.
+
+**off_adhd_med**: 0 or 1, 1-times since baseline when without using ADHD medication.
+
+```{r}
+## dates on which start or end.
+rx_adhd <- melt(rx_adhd, id.vars = "pin", measure.vars = c("adhd_start", "adhd_end"), variable.name = "adhd_treat_type", value.name = "adhd_treat_date")
+
+rx_adhd <- rx_adhd[dt[,.(pin,baseline_date,follow_end)], on = .(pin)] 
+## those not use ADHD medication since diagnose or after baseline date.
+rx_adhd[is.na(adhd_treat_type), adhd_treat_type:="never"]
+
+## time since baseline at which starts, ends or never happens.
+rx_adhd[, since_baseline_time := adhd_treat_date - baseline_date]
+rx_adhd[adhd_treat_type=="never", since_baseline_time:=0]
+
+## code the ADHD medication treat off and on under time since baseline.
+rx_adhd[, off_adhd_med := fifelse(adhd_treat_type == "adhd_end"|adhd_treat_type == "never", 1, 0)]
+rx_adhd <- rx_adhd[,.(pin, off_adhd_med, since_baseline_time)]
+```
+
+# Define both time-varying hypertension and ADHD medication on and off over time
+
+**ADHD**: 1-no use adhd medication; 0-use adhd medication.
+
+**hyper**: 1-no use hypertension medication; 0-use hypertension medication.
+
+**since_baseline_time**: days, time since baseline.
+
+```{r}
+rx_adhd[, `:=`(med_type = "ADHD", med_status = off_adhd_med)]
+rx_hyper[, `:=`(med_type = "hyper", med_status = off_hyper_med)]
+rx_adhd[, off_adhd_med:=NULL]
+rx_hyper[, off_hyper_med:= NULL]
+
+rx_med <- rbind(rx_adhd, rx_hyper)
+rx_med <- dcast(rx_med, pin + since_baseline_time ~ med_type, value.var = "med_status", fill = NA, fun.aggregate = sum)
+
+rx_med <- rx_med[order(pin,since_baseline_time), ]
+rx_med[, ADHD := nafill(ADHD, type = "locf"), by = pin]
+rx_med[, hyper := nafill(hyper, type = "locf"), by = pin]
+
+rx_med[is.na(ADHD), ADHD:=1]
+rm(rx_adhd)
+rm(rx_hyper)
+```
+
+# Define ADHD status and diagnosis time
+
+**adhd**: diagnosis before or at follow_end as 1, otherwise as 0.
+
+**adhd_time**: diagnosis time from baseline.
+
+```{r}
+## the period between adhd first date and baseline date
+dt[, adhd_time := adhd_date - baseline_date]
+## define time-varying adhd status before follow_end,follow_end_days = CRdeath_time = noCRdeath_time.
+dt[is.na(adhd_time), adhd := 0]
+dt[!is.na(adhd_time)&adhd_time>follow_end_days, adhd := 0]
+dt[is.na(adhd), adhd:=1]
+
+## define adhd_time
+dt[, adhd_time := fifelse(adhd==0|adhd_time <=0, 0, adhd_time)]
+```
+
+# Create time-varying exposure and covariate data
+
+**exposure**: ADHD as time-varying variable, before diagnosis as 0, after diagnosis as 1.
+
+**hypertension_med**: time-varying variable, off antihypertensive medication use (0) vs on antihypertensive medication use(1).
+
+**on_adhd_med**: time-varying exposure, on ADHD medication (1), off ADHD medication (1).
+
+```{r}
+## only covariates, baseline and follow end date data.
+dt_base <- dt[, !c("adhd","adhd_time","adhd_date", 
+                   "death_date", "noCRdeath_date", "CRdeath_date", "stroke_date", "AMI_date", "HHF_date", "CKD_date",
+                   "CRdeath", "CRdeath_time", "noCRdeath", "noCRdeath_time",
+                   "AMI", "AMI_time", "HHF", "HHF_time", 
+                   "stroke", "stroke_time", "CKD", "CKD_time"), with = FALSE]
+## events
+dt_base <- tmerge(dt_base, dt, id = pin,  
+                  CRdeath = event(CRdeath_time, CRdeath),
+                  noCRdeath = event(noCRdeath_time, noCRdeath),
+                  AMI = event(AMI_time, AMI),
+                  HHF = event(HHF_time, HHF),
+                  stroke = event(stroke_time, stroke),
+                  CKD = event(CKD_time, CKD))
+## hyper_med: intermediate variable,0-use medication; 1-not use. as well as adhd_med
+dt_base <- tmerge(data1 = dt_base, data2 = rx_med, id = pin, 
+                  adhd_med = tdc(since_baseline_time, ADHD, 1),
+                  hyper_med = tdc(since_baseline_time, hyper, 1))
+## exposure: 0-no ADHD,1-ADHD
+dt_base <- tmerge(data1 = dt_base, data2 = dt, id = pin, 
+                  exposure = cumtdc(adhd_time, adhd, 0))
+#### hypertension_med: antihypertensive medication, 0-not use, 1-use medication. 
+dt_base <- dt_base %>% 
+  mutate(on_adhd_med = dplyr::case_when(
+    adhd_med == 0 ~ 1,
+    TRUE ~ 0
+  ))%>% 
+  mutate(hypertension_med = dplyr::case_when(
+    hyper_med == 0 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  dplyr::select(-hyper_med, -adhd_med)
+
+setDT(dt_base)
+```
+
+
+# Part 3: Multistate model (P3) - ADHD
+
+## 1. set the transition matrix
+
+**tmat**: transition matrix: total 19 transitions
+
+```{r}
+tmat <- matrix(NA, 7, 7)
+dimnames(tmat) <- list(from = c("hypertension", "CKD", "stroke","AMI", "HHF","CRdeath", "noCRdeath"),
+                       to = c("hypertension", "CKD", "stroke", "AMI", "HHF", "CRdeath", "noCRdeath"))
+tmat[1,] <- c(NA,1,2,3,4,5,6)
+tmat[2,] <- c(NA,NA,NA,NA,NA,7,8)
+tmat[3,] <- c(NA,NA,NA,NA,NA,9,10)
+tmat[4,] <- c(NA,NA,NA,NA,NA,11,12)
+tmat[5,] <- c(NA,NA,NA,NA,NA,13,14)
+tmat[6,] <- c(NA,NA,NA,NA,NA,NA,NA)
+tmat[7,] <- c(NA,NA,NA,NA,NA,NA,NA)
+
+print(tmat)
+```
+
+## 2. create multiple state transitions data
+
+```{r}
+library(mstate)
+
+covs <- c("pin")
+dt <- as.data.frame(dt)
+## start state: state into which no transitions are possible, set NA for time and status in the msprep function. (ref: mstate)
+msbmt <- msprep(time = c(NA, "CKD_time", "stroke_time", "AMI_time", "HHF_time", "CRdeath_time", "noCRdeath_time"),
+                status = c(NA, "CKD", "stroke", "AMI", "HHF", "CRdeath", "noCRdeath"), 
+                data = dt, 
+                trans = tmat,
+                keep = covs) 
+
+events(msbmt) %>% print()
+
+setDT(dt)
+msbmt <- as_tibble(msbmt)
+msbmt <- msbmt %>% dplyr::select(pin, Tstart, Tstop, time, trans, status) 
+setDT(msbmt)
+```
+
+## 3. estimate cox model for each transition
+
+### Step 1: functions
+
+```{r}
+# Define format function
+myformat <- function(x, digit = 4, sep = TRUE) {format(round(as.numeric(x), digit), nsmall = digit, trim = TRUE, big.mark = ifelse(sep, ",", ""))}
+
+# Define Cox regression function
+cox_analysis <- function(data, formula, transition_number, part){
+  formula_vars <- all.vars(formula)
+  for (var in formula_vars) {
+    if (var %in% names(data) && length(unique(data[[var]])) == 1) {
+      formula <- update(formula, as.formula(paste(". ~ . -", var)))}} 
+  # Automatically remove variables in formulas with only one unique value. id = pin can be omit for two-state model, since it is automatically set.
+  model <- coxph(formula, data = data, id = pin, model = TRUE) # robust = TRUE and FALSE are the same
+  saveRDS(model, paste0("processData/",part,"/model_transition", transition_number, ".rds"))
+}
+
+# get tidied time-varying data for each transition, and get HR
+fit_model <- function(transition, cox_formulas, data_base, data_ms, part){
+  ## get tidied time-varying data for each transition
+  msdt <- data_ms[trans== transition, ]
+  covdt <- data_base[pin%in%msdt$pin,]
+  tsdt <- msdt[covdt, on =.(pin = pin, Tstop >= tstop, Tstart <=tstart)][!is.na(trans),]
+  # update baseline over time from baseline.
+  tsdt <- tsdt[, hypertension_duration := min(Tstart), by = pin][, hypertension_duration:= hypertension_duration/365]
+  tsdt[, baseline_yr:=baseline_yr+as.integer(hypertension_duration)]
+  tsdt[, baseline_yr_cat := fifelse(baseline_yr <2018, 0, 1)]
+  tsdt[, age:=age+as.integer(hypertension_duration)]
+  
+  tsdt[order(pin, Tstart), `:=`(tstart = Tstart - min(Tstart), tstop = Tstop - min(Tstart)), by = pin]
+  tsdt[tstop<time, status := 0]
+  tsdt <- as.data.frame(tsdt)
+  ## choose formula
+  if(transition <=6){formula = cox_formulas$formula1}else{formula = cox_formulas$formula2}
+
+  ## estimate cox model use tsdt for each transition
+  cox_analysis(data = tsdt, formula = formula, transition_number = transition, part = part)
+}
+```
+
+
+### Step 2: fitted model
+
+```{r}
+##################### estimate HR ########################
+# define formulas for analysis         
+cox_formulas <-list(
+  formula1 = Surv(tstart, tstop, status) ~
+    exposure + on_adhd_med + sex + baseline_yr_cat + age +
+    hypertension_med + t2d + hyperlipid,
+
+  formula2 = Surv(tstart, tstop, status) ~
+    exposure + on_adhd_med + sex + baseline_yr_cat + age +
+    hypertension_med + t2d + hyperlipid + hypertension_duration) 
+
+
+for(i in 1:14){
+  fit_model(transition = i, cox_formulas = cox_formulas, data_base = dt_base, data_ms = msbmt, part = "adhd")
+  print(i)
+}
+fwrite(dt_base, "processData/adhd/dt_covariate.csv")
+fwrite(msbmt, "processData/adhd/dt_ms.csv")
+rm(dt)
+rm(rx_med)
+gc()
+```
+
+
+###Step 3. assess model fitting
+
+```{r}
+# cox models at each transition
+ls_model <- list()
+for(i in 1:14){
+  ls_model[[i]] <- readRDS(paste0("processData/adhd/model_transition", i , ".rds"))
+  print(i)
+  summary(ls_model[[i]]) %>% print()
+}
+```
+
+
+# Part 4: Model time-varying cumulative counts of hypertension medication using conditional rate model
+
+```{r}
+dt_poisson <- data.frame()
+
+for(i in 1:14){
+  ## get tidied time-varying data for each transition
+  msdt <- msbmt[trans==i, ]
+  covdt <- dt_base[pin%in%msdt$pin,]
+  tsdt <- msdt[covdt, on =.(pin = pin, Tstop >= tstop, Tstart <=tstart)][!is.na(trans),]
+  # update baseline over time from baseline.
+  tsdt <- tsdt[, hypertension_duration := min(Tstart), by = pin][, hypertension_duration:= hypertension_duration/365]
+  tsdt[, baseline_yr:=baseline_yr+as.integer(hypertension_duration)]
+  tsdt[, baseline_yr_cat := fifelse(baseline_yr <2018, 0, 1)]
+  tsdt[, age:=age+as.integer(hypertension_duration)]
+  
+  tsdt[order(pin, Tstart), `:=`(tstart = Tstart - min(Tstart), tstop = Tstop - min(Tstart)), by = pin]
+  tsdt[tstop<time, status := 0]
+  tsdt[,days:=tstop-tstart][,counts_hyper_med:=days*hypertension_med]
+  tsdt[,cum_hyper_med:=sum(counts_hyper_med), by = pin]
+  tsdtp <- tsdt[order(pin, tstart), .SD[1], by = pin][,.(pin, time, cum_hyper_med, trans, exposure, on_adhd_med, sex, age, baseline_yr, baseline_yr_cat, psych_any, t2d, hyperlipid, SES, hypertension_duration)]
+  tsdtp <- as.data.frame(tsdtp)
+  dt_poisson <- rbind(dt_poisson, tsdtp)
+  print(i)
+}
+setDT(dt_poisson)
+dt_poisson[trans <=6, trans_state:="hypertension"]
+dt_poisson[trans==7|trans==8, trans_state:="CKD"]
+dt_poisson[trans==9|trans==10, trans_state:="stroke"]
+dt_poisson[trans==11|trans==12, trans_state:="AMI"]
+dt_poisson[trans==13|trans==14, trans_state:="HHF"]
+dt_poisson <- dt_poisson[order(pin, trans), .SD[1], by=.(pin, trans)]
+dt_poisson <- as.data.frame(dt_poisson)
+# Poisson
+fit_poisson <- glm(cum_hyper_med ~ exposure + on_adhd_med + sex + baseline_yr_cat + age + t2d + hyperlipid + hypertension_duration + trans_state + offset(log(time)), 
+                   data = dt_poisson, family = poisson)
+
+# check poisson model
+fit_poisson %>% summary()
+
+# predict rate per day.
+newdt <- dt_poisson
+newdt$time <-1
+pre <- predict(fit_poisson, type="response", newdata = newdt, offset = log(time))
+pre %>% summary()
+
+# save poisson model
+saveRDS(fit_poisson, "processData/adhd/fit_poisson.rds")
+```
+
