@@ -1,0 +1,23 @@
+# ADHD and cardiorenal trajectory after hypertension: demo package
+
+## Contents
+- `Step2-conditional transition rate.qmd`
+- `Microsimulation logical structure codes.qmd`
+
+## Software requirements
+- R >= 4.2.3
+- Packages: data.table, survival, mstate, tableone, ggplot2, IRanges, survminer, tibble, zoo, forecast, foreach, doParallel
+
+## Tested on
+- Windows 11
+- R 4.2.3
+
+## Installation
+Install required packages in R:
+```r
+install.packages(c(
+  "data.table", "survival", "mstate", "tableone", "ggplot2",
+  "survminer", "tibble", "zoo", "forecast", "foreach", "doParallel"
+))
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("IRanges")
